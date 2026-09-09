@@ -20,21 +20,36 @@
 
 ## Flow
 
+### Play (instant stream + background S3)
+
 ```
-moziketo-wave  →  POST /v1/ingest  →  moz-downloader
-                                         ↓ yt-dlp (YouTube search)
-                                         ↓ Arvan S3 music/{key}.mp3
-                    ← download_url ←
+Frontend  →  POST /v1/play  →  ~1s response { stream_url, job_id }
+                ↓
+         Thread 1: yt-dlp → temp MP3 (stream reads while growing)
+         Thread 2: (same file) → S3 when complete
+                ↓
+GET stream_url  →  audio/mpeg (HTML5 <audio>)
+GET /v1/jobs/{id}  →  download_url when ready
+```
+
+### Ingest (blocking — legacy)
+
+```
+POST /v1/ingest  →  wait ~20s  →  download_url
 ```
 
 ## API
 
-All routes require header `X-Moziketo-Relay-Secret`.
+Protected routes: header `X-Moziketo-Relay-Secret`.  
+Stream route: `?token=` from `/v1/play` (for `<audio src>`).
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | S3 + yt-dlp + ffmpeg status |
-| POST | `/v1/ingest` | Download Spotify track → S3 |
+| POST | `/v1/play` | **Instant** stream URL + background S3 |
+| GET | `/v1/stream/{job_id}?token=` | Stream MP3 while downloading |
+| GET | `/v1/jobs/{job_id}` | Poll — `download_url` when ready |
+| POST | `/v1/ingest` | Blocking download → S3 |
 
 ### Ingest request
 
