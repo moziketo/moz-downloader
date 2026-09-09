@@ -13,7 +13,7 @@ from typing import Callable, Literal
 
 logger = logging.getLogger("moz-downloader.jobs")
 
-JobStatus = Literal["starting", "downloading", "uploading", "ready", "failed"]
+JobStatus = Literal["starting", "streaming", "downloading", "uploading", "ready", "failed"]
 
 MEDIA_TYPE_BY_SUFFIX = {
     ".mp3": "audio/mpeg",
@@ -39,9 +39,13 @@ class PlayJob:
     download_url: str | None = None
     presigned_url: str | None = None
     size_bytes: int = 0
+    direct_url: str | None = None
+    direct_media_type: str = "audio/mp4"
     error: str | None = None
+    direct_ready: threading.Event = field(default_factory=threading.Event)
     download_done: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = field(default=None, repr=False)
+    _resolve_thread: threading.Thread | None = field(default=None, repr=False)
 
 
 class JobStore:
@@ -124,6 +128,25 @@ def buffer_bytes(job: PlayJob) -> int:
         return 0
 
 
+def start_resolve_thread(job: PlayJob, *, resolve_fn: Callable[[PlayJob], None]) -> None:
+    def _worker() -> None:
+        try:
+            resolve_fn(job)
+        except Exception as exc:
+            logger.exception("direct resolve failed for %s", job.job_id)
+            job.error = str(exc)[:500]
+            if job.status == "starting":
+                job.status = "failed"
+        finally:
+            job.direct_ready.set()
+
+    thread = threading.Thread(
+        target=_worker, name=f"moz-resolve-{job.job_id[:8]}", daemon=True
+    )
+    job._resolve_thread = thread
+    thread.start()
+
+
 def start_download_thread(
     job: PlayJob,
     *,
@@ -131,7 +154,8 @@ def start_download_thread(
     upload_fn: Callable[[PlayJob], tuple[str, str | None]],
 ) -> None:
     def _worker() -> None:
-        job.status = "downloading"
+        if job.status != "streaming":
+            job.status = "downloading"
         try:
             download_fn(job)
             job.size_bytes = job.temp_path.stat().st_size

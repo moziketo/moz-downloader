@@ -28,13 +28,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from jobs import (
     PlayJob,
-    find_growing_audio,
     buffer_bytes,
+    find_growing_audio,
     iter_stream_chunks,
     job_stem,
     job_store,
     media_type_for_path,
     start_download_thread,
+    start_resolve_thread,
 )
 
 logger = logging.getLogger("moz-downloader")
@@ -130,12 +131,13 @@ class JobStatusResponse(BaseModel):
     s3_key: str
     size_bytes: int = 0
     buffer_bytes: int = 0
+    direct_ready: bool = False
     download_url: str | None = None
     presigned_url: str | None = None
     error: str | None = None
 
 
-app = FastAPI(title="Moziketo Downloader", version="0.4.0")
+app = FastAPI(title="Moziketo Downloader", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -198,6 +200,9 @@ def _safe_key(
     if spotify_id:
         return f"{spotify_id}.mp3"
     return f"{uuid.uuid4().hex}.mp3"
+
+
+YTDLP_EXTRACT_ARGS = ["--extractor-args", "youtube:player_client=android,web"]
 
 
 def _ytdlp_bin(settings: Settings) -> str:
@@ -357,6 +362,45 @@ def _to_mp3(source: Path, dest: Path) -> None:
         source.unlink(missing_ok=True)
 
 
+def _guess_direct_media_type(url: str) -> str:
+    lower = url.lower()
+    if "mime=audio%2Fmp4" in lower or "mime=audio/mp4" in lower or ".m4a" in lower:
+        return "audio/mp4"
+    if "mime=audio%2Fwebm" in lower or "mime=audio/webm" in lower or ".webm" in lower:
+        return "audio/webm"
+    return "audio/mp4"
+
+
+def _ytdlp_resolve_direct_url(settings: Settings, *, query: str) -> tuple[str, str]:
+    """Resolve YouTube CDN URL via yt-dlp -g (no download)."""
+    cmd = [
+        _ytdlp_bin(settings),
+        f"ytsearch1:{query}",
+        "--no-playlist",
+        "-f",
+        "140/ba/b",
+        "-g",
+        *YTDLP_EXTRACT_ARGS,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "yt-dlp resolve failed")[-800:])
+    line = proc.stdout.strip().split("\n")[0].strip()
+    if not line.startswith("http"):
+        raise RuntimeError("yt-dlp did not return a stream URL")
+    return line, _guess_direct_media_type(line)
+
+
+def _resolve_direct_worker(settings: Settings, job: PlayJob) -> None:
+    url, media_type = _ytdlp_resolve_direct_url(
+        settings, query=f"{job.artist} {job.title}"
+    )
+    job.direct_url = url
+    job.direct_media_type = media_type
+    job.status = "streaming"
+    logger.info("direct stream ready job=%s media=%s", job.job_id[:8], media_type)
+
+
 def _ytdlp_to_file(settings: Settings, *, query: str, out_path: Path) -> None:
     """Blocking ingest — full mp3 for S3 upload."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -458,6 +502,7 @@ def _job_to_status(job: PlayJob) -> JobStatusResponse:
         s3_key=job.s3_key,
         size_bytes=job.size_bytes,
         buffer_bytes=buffer_bytes(job),
+        direct_ready=bool(job.direct_url),
         download_url=job.download_url,
         presigned_url=job.presigned_url,
         error=job.error,
@@ -582,6 +627,7 @@ async def play(body: PlayRequest, request: Request) -> PlayResponse:
         s3_key=s3_key,
         temp_path=temp_path,
     )
+    start_resolve_thread(job, resolve_fn=lambda j: _resolve_direct_worker(settings, j))
     start_download_thread(
         job,
         download_fn=lambda j: _download_job_file(settings, j),
@@ -611,19 +657,66 @@ async def job_status(job_id: str) -> JobStatusResponse:
     return _job_to_status(job)
 
 
+def _wait_for_direct(job: PlayJob, *, timeout: float = 25.0) -> str | None:
+    if job.direct_url:
+        return job.direct_url
+    job.direct_ready.wait(timeout=timeout)
+    return job.direct_url
+
+
 @app.get("/v1/stream/{job_id}")
 async def stream_job(
     job_id: str,
     request: Request,
     token: str | None = Query(default=None),
 ):
-    """Stream MP3 while download runs. Token in query for HTML5 audio."""
+    """Proxy YouTube CDN URL (fast) or fall back to growing file on disk."""
     job = job_store.verify_stream(job_id, token)
     if job is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
-    start = 0
     range_header = request.headers.get("range")
+    filename = job.s3_key.rsplit("/", 1)[-1]
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache",
+        "Content-Disposition": f'inline; filename="{filename}"',
+    }
+
+    direct_url = await asyncio.to_thread(_wait_for_direct, job)
+    if direct_url:
+        upstream_headers = {"User-Agent": "Mozilla/5.0 (compatible; MoziketoDownloader/0.5)"}
+        if range_header:
+            upstream_headers["Range"] = range_header
+
+        def _open_upstream():
+            req = urllib.request.Request(direct_url, headers=upstream_headers)
+            return urllib.request.urlopen(req, timeout=120)
+
+        upstream = await asyncio.to_thread(_open_upstream)
+        for name in ("Content-Range", "Content-Length", "Accept-Ranges"):
+            value = upstream.headers.get(name)
+            if value:
+                headers[name] = value
+
+        def _direct_gen():
+            try:
+                while True:
+                    chunk = upstream.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                upstream.close()
+
+        return StreamingResponse(
+            _direct_gen(),
+            status_code=upstream.status,
+            media_type=job.direct_media_type,
+            headers=headers,
+        )
+
+    start = 0
     stem = job_stem(job)
     active = find_growing_audio(stem)
     if range_header and active is not None:
@@ -632,25 +725,20 @@ async def stream_job(
         except ValueError:
             start = 0
 
-    def _generator():
+    def _file_gen():
         yield from iter_stream_chunks(job, start=start)
 
     media_type = media_type_for_path(active or job.temp_path)
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "no-cache",
-        "Content-Disposition": f'inline; filename="{job.s3_key.rsplit("/", 1)[-1]}"',
-    }
     if range_header and start > 0:
         headers["Content-Range"] = f"bytes {start}-*/"
         return StreamingResponse(
-            _generator(),
+            _file_gen(),
             status_code=206,
             media_type=media_type,
             headers=headers,
         )
 
-    return StreamingResponse(_generator(), media_type=media_type, headers=headers)
+    return StreamingResponse(_file_gen(), media_type=media_type, headers=headers)
 
 
 @app.post("/v1/ingest", response_model=IngestResponse, dependencies=[Depends(_verify_secret)])
