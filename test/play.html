@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Moz Downloader — Play Test</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { max-width: 720px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e8eaed; }
+    h1 { font-size: 1.25rem; margin-bottom: 0.25rem; }
+    p.sub { color: #9aa0a6; font-size: 0.9rem; margin-top: 0; }
+    label { display: block; margin: 1rem 0 0.35rem; font-size: 0.85rem; color: #bdc1c6; }
+    input, button { width: 100%; box-sizing: border-box; font: inherit; border-radius: 8px; border: 1px solid #3c4043; }
+    input { padding: 0.65rem 0.75rem; background: #1a1d23; color: #e8eaed; }
+    button { margin-top: 1rem; padding: 0.75rem; background: #1db954; color: #000; border: none; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: wait; }
+    .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin: 1rem 0; }
+    .metric { background: #1a1d23; border: 1px solid #3c4043; border-radius: 8px; padding: 0.75rem; text-align: center; }
+    .metric b { display: block; font-size: 1.4rem; color: #1db954; }
+    .metric span { font-size: 0.75rem; color: #9aa0a6; }
+    audio { width: 100%; margin: 1rem 0; }
+    pre { background: #1a1d23; border: 1px solid #3c4043; border-radius: 8px; padding: 0.75rem; overflow: auto; font-size: 0.75rem; white-space: pre-wrap; word-break: break-all; }
+    a.dl { display: inline-block; margin-top: 0.5rem; color: #8ab4f8; }
+    .err { color: #f28b82; margin-top: 0.75rem; }
+  </style>
+</head>
+<body>
+  <h1>moz-downloader — Play Test</h1>
+  <p class="sub">Production · POST /v1/play → stream فوری + S3 در پس‌زمینه</p>
+
+  <label for="api">API Base</label>
+  <input id="api" value="http://130.185.120.239:8787" />
+
+  <label for="secret">X-Moziketo-Relay-Secret</label>
+  <input id="secret" type="password" placeholder="from credentials.env" autocomplete="off" />
+
+  <label for="url">Spotify URL</label>
+  <input id="url" value="https://open.spotify.com/track/4PJEK76V3A1S0XzZJuTWh7" />
+
+  <button id="playBtn">▶ Play</button>
+
+  <div class="metrics">
+    <div class="metric"><b id="tPlay">—</b><span>play API (ms)</span></div>
+    <div class="metric"><b id="tCanplay">—</b><span>canplay (ms)</span></div>
+    <div class="metric"><b id="tReady">—</b><span>S3 ready (ms)</span></div>
+  </div>
+
+  <audio id="audio" controls preload="none"></audio>
+  <div id="meta"></div>
+  <pre id="log">Ready.</pre>
+  <div id="err" class="err"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const log = (msg) => { $('log').textContent = msg; };
+
+    $('secret').value = localStorage.getItem('moz_relay_secret') || '';
+
+    $('playBtn').addEventListener('click', async () => {
+      $('err').textContent = '';
+      $('playBtn').disabled = true;
+      $('tPlay').textContent = $('tCanplay').textContent = $('tReady').textContent = '…';
+      $('meta').innerHTML = '';
+      const audio = $('audio');
+      audio.removeAttribute('src');
+      audio.load();
+
+      const api = $('api').value.replace(/\/$/, '');
+      const secret = $('secret').value.trim();
+      const url = $('url').value.trim();
+      if (!secret) { $('err').textContent = 'Secret لازم است'; $('playBtn').disabled = false; return; }
+      localStorage.setItem('moz_relay_secret', secret);
+
+      const t0 = performance.now();
+      try {
+        const res = await fetch(`${api}/v1/play`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Moziketo-Relay-Secret': secret,
+          },
+          body: JSON.stringify({ url }),
+        });
+        const tPlay = Math.round(performance.now() - t0);
+        $('tPlay').textContent = tPlay;
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        log(JSON.stringify(data, null, 2));
+
+        $('meta').innerHTML = `<strong>${data.artist}</strong> — ${data.title}`;
+
+        const onCanPlay = () => {
+          $('tCanplay').textContent = Math.round(performance.now() - t0);
+          audio.removeEventListener('canplay', onCanPlay);
+        };
+        audio.addEventListener('canplay', onCanPlay);
+        audio.src = data.stream_url;
+        audio.play().catch(() => {});
+
+        const poll = async () => {
+          const st = await fetch(`${api}/v1/jobs/${data.job_id}`, {
+            headers: { 'X-Moziketo-Relay-Secret': secret },
+          });
+          const job = await st.json();
+          if (job.status === 'ready') {
+            $('tReady').textContent = Math.round(performance.now() - t0);
+            const dl = job.presigned_url || job.download_url;
+            $('meta').innerHTML += `<br><a class="dl" href="${dl}" download>⬇ Download MP3</a>`;
+            return;
+          }
+          if (job.status === 'failed') {
+            $('err').textContent = job.error || 'Job failed';
+            return;
+          }
+          setTimeout(poll, 1500);
+        };
+        poll();
+      } catch (e) {
+        $('err').textContent = String(e.message || e);
+        log(String(e));
+      } finally {
+        $('playBtn').disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
