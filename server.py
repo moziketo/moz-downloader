@@ -137,8 +137,9 @@ app.add_middleware(
         "http://localhost:8765",
         "http://127.0.0.1:8765",
     ],
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
+    expose_headers=["Accept-Ranges", "Content-Range", "Content-Length", "Content-Type"],
 )
 
 
@@ -248,27 +249,30 @@ def _spotify_embed_metadata(track_id: str) -> tuple[str | None, str | None]:
 def _spotify_api_metadata(settings: Settings, track_id: str) -> tuple[str | None, str | None]:
     if not settings.spotify_client_id or not settings.spotify_client_secret:
         return None, None
-    token_req = urllib.request.Request(
-        "https://accounts.spotify.com/api/token",
-        data=b"grant_type=client_credentials",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    auth = base64.b64encode(
-        f"{settings.spotify_client_id}:{settings.spotify_client_secret}".encode()
-    ).decode()
-    token_req.add_header("Authorization", f"Basic {auth}")
-    with urllib.request.urlopen(token_req, timeout=20) as resp:
-        token = json.loads(resp.read()).get("access_token")
-    if not token:
-        return None, None
+    try:
+        token_req = urllib.request.Request(
+            "https://accounts.spotify.com/api/token",
+            data=b"grant_type=client_credentials",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        auth = base64.b64encode(
+            f"{settings.spotify_client_id}:{settings.spotify_client_secret}".encode()
+        ).decode()
+        token_req.add_header("Authorization", f"Basic {auth}")
+        with urllib.request.urlopen(token_req, timeout=20) as resp:
+            token = json.loads(resp.read()).get("access_token")
+        if not token:
+            return None, None
 
-    track_req = urllib.request.Request(
-        f"https://api.spotify.com/v1/tracks/{track_id}",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    with urllib.request.urlopen(track_req, timeout=20) as resp:
-        data = json.loads(resp.read())
+        track_req = urllib.request.Request(
+            f"https://api.spotify.com/v1/tracks/{track_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(track_req, timeout=20) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None, None
     title = str(data.get("name") or "").strip() or None
     artists = data.get("artists") or []
     artist = str(artists[0].get("name") or "").strip() if artists else None
@@ -305,6 +309,10 @@ def _resolve_metadata(
 
     if title and artist:
         return title, artist
+    if title:
+        return title, artist or "Unknown Artist"
+    if track_id:
+        return f"Spotify Track {track_id[:8]}", "Unknown Artist"
 
     raise RuntimeError("Could not resolve Spotify track metadata from URL")
 

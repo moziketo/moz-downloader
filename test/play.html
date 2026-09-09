@@ -3,15 +3,15 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Moz Downloader — Play Test</title>
+  <title>Moziketo — Stream Test</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
     body { max-width: 720px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e8eaed; }
     h1 { font-size: 1.25rem; margin-bottom: 0.25rem; }
     p.sub { color: #9aa0a6; font-size: 0.9rem; margin-top: 0; }
     label { display: block; margin: 1rem 0 0.35rem; font-size: 0.85rem; color: #bdc1c6; }
-    input, button { width: 100%; box-sizing: border-box; font: inherit; border-radius: 8px; border: 1px solid #3c4043; }
-    input { padding: 0.65rem 0.75rem; background: #1a1d23; color: #e8eaed; }
+    input, select, button { width: 100%; box-sizing: border-box; font: inherit; border-radius: 8px; border: 1px solid #3c4043; }
+    input, select { padding: 0.65rem 0.75rem; background: #1a1d23; color: #e8eaed; }
     button { margin-top: 1rem; padding: 0.75rem; background: #1db954; color: #000; border: none; font-weight: 600; cursor: pointer; }
     button:disabled { opacity: 0.5; cursor: wait; }
     .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin: 1rem 0; }
@@ -20,34 +20,53 @@
     .metric span { font-size: 0.75rem; color: #9aa0a6; }
     audio { width: 100%; margin: 1rem 0; }
     pre { background: #1a1d23; border: 1px solid #3c4043; border-radius: 8px; padding: 0.75rem; overflow: auto; font-size: 0.75rem; white-space: pre-wrap; word-break: break-all; }
-    a.dl { display: inline-block; margin-top: 0.5rem; color: #8ab4f8; }
     .err { color: #f28b82; margin-top: 0.75rem; }
+    .panel { display: none; }
+    .panel.active { display: block; }
   </style>
 </head>
 <body>
-  <h1>moz-downloader — Play Test</h1>
-  <p class="sub">Production · POST /v1/play → stream فوری + S3 در پس‌زمینه</p>
+  <h1>Moziketo — Stream Test</h1>
+  <p class="sub">Wave (production) یا moz-downloader مستقیم</p>
 
-  <label for="api">API Base</label>
-  <input id="api" value="http://130.185.120.239:8787" />
+  <label for="mode">Mode</label>
+  <select id="mode">
+    <option value="wave" selected>Wave — GET /stream/{key} (مثل فرانت)</option>
+    <option value="downloader">Downloader — POST /v1/play مستقیم</option>
+  </select>
 
-  <label for="secret">X-Moziketo-Relay-Secret</label>
-  <input id="secret" type="password" placeholder="from credentials.env" autocomplete="off" />
+  <div id="wavePanel" class="panel active">
+    <label for="waveApi">Wave API</label>
+    <input id="waveApi" value="https://api.moziketo.ir/api/v1" />
 
-  <label for="url">Spotify URL</label>
-  <input id="url" value="https://open.spotify.com/track/4PJEK76V3A1S0XzZJuTWh7" />
+    <label for="query">Search query</label>
+    <input id="query" value="never give up sia" />
 
-  <button id="playBtn">▶ Play</button>
+    <button id="waveBtn">▶ Search + Play (Wave)</button>
+  </div>
+
+  <div id="dlPanel" class="panel">
+    <label for="api">Downloader API</label>
+    <input id="api" value="http://130.185.120.239:8787" />
+
+    <label for="secret">X-Moziketo-Relay-Secret</label>
+    <input id="secret" type="password" placeholder="from credentials.env" autocomplete="off" />
+
+    <label for="url">Spotify URL</label>
+    <input id="url" value="https://open.spotify.com/track/1ssmjAYSU5PbmsjLq5yrNH" />
+
+    <button id="playBtn">▶ Play (Downloader)</button>
+  </div>
 
   <div class="metrics">
-    <div class="metric"><b id="tPlay">—</b><span>play API (ms)</span></div>
+    <div class="metric"><b id="tPlay">—</b><span>API (ms)</span></div>
     <div class="metric"><b id="tCanplay">—</b><span>canplay (ms)</span></div>
     <div class="metric"><b id="tReady">—</b><span>S3 ready (ms)</span></div>
   </div>
 
-  <audio id="audio" controls preload="none"></audio>
+  <audio id="audio" controls preload="none" crossorigin="anonymous"></audio>
   <div id="meta"></div>
-  <pre id="log">Ready.</pre>
+  <pre id="log">Ready — serve.sh then open http://127.0.0.1:8765/play.html</pre>
   <div id="err" class="err"></div>
 
   <script>
@@ -56,22 +75,69 @@
 
     $('secret').value = localStorage.getItem('moz_relay_secret') || '';
 
-    $('playBtn').addEventListener('click', async () => {
+    $('mode').addEventListener('change', () => {
+      const wave = $('mode').value === 'wave';
+      $('wavePanel').classList.toggle('active', wave);
+      $('dlPanel').classList.toggle('active', !wave);
+    });
+
+    function resetMetrics() {
       $('err').textContent = '';
-      $('playBtn').disabled = true;
       $('tPlay').textContent = $('tCanplay').textContent = $('tReady').textContent = '…';
       $('meta').innerHTML = '';
       const audio = $('audio');
       audio.removeAttribute('src');
       audio.load();
+    }
 
+    function attachAudio(src, t0) {
+      const audio = $('audio');
+      const onCanPlay = () => {
+        $('tCanplay').textContent = Math.round(performance.now() - t0);
+        audio.removeEventListener('canplay', onCanPlay);
+      };
+      audio.addEventListener('canplay', onCanPlay);
+      audio.addEventListener('error', () => {
+        $('err').textContent = 'audio error — check CORS / Range / network tab';
+      });
+      audio.src = src;
+      audio.play().catch(() => {});
+    }
+
+    $('waveBtn').addEventListener('click', async () => {
+      resetMetrics();
+      $('waveBtn').disabled = true;
+      const t0 = performance.now();
+      try {
+        const base = $('waveApi').value.replace(/\/$/, '');
+        const q = $('query').value.trim();
+        const search = await fetch(`${base}/search?q=${encodeURIComponent(q)}`);
+        if (!search.ok) throw new Error(await search.text());
+        const data = await search.json();
+        $('tPlay').textContent = Math.round(performance.now() - t0);
+        if (!data.hits?.length) throw new Error('No search hits');
+        const hit = data.hits[0];
+        log(JSON.stringify({ hit, stream: `${base}/stream/${hit.key}` }, null, 2));
+        $('meta').innerHTML = `<strong>${hit.artist_name}</strong> — ${hit.title}<br><code>key=${hit.key}</code>`;
+        attachAudio(`${base}/stream/${hit.key}`, t0);
+      } catch (e) {
+        $('err').textContent = String(e.message || e);
+        log(String(e));
+      } finally {
+        $('waveBtn').disabled = false;
+      }
+    });
+
+    $('playBtn').addEventListener('click', async () => {
+      resetMetrics();
+      $('playBtn').disabled = true;
+      const t0 = performance.now();
       const api = $('api').value.replace(/\/$/, '');
       const secret = $('secret').value.trim();
       const url = $('url').value.trim();
       if (!secret) { $('err').textContent = 'Secret لازم است'; $('playBtn').disabled = false; return; }
       localStorage.setItem('moz_relay_secret', secret);
 
-      const t0 = performance.now();
       try {
         const res = await fetch(`${api}/v1/play`, {
           method: 'POST',
@@ -81,21 +147,12 @@
           },
           body: JSON.stringify({ url }),
         });
-        const tPlay = Math.round(performance.now() - t0);
-        $('tPlay').textContent = tPlay;
+        $('tPlay').textContent = Math.round(performance.now() - t0);
         if (!res.ok) throw new Error(await res.text());
         const data = await res.json();
         log(JSON.stringify(data, null, 2));
-
         $('meta').innerHTML = `<strong>${data.artist}</strong> — ${data.title}`;
-
-        const onCanPlay = () => {
-          $('tCanplay').textContent = Math.round(performance.now() - t0);
-          audio.removeEventListener('canplay', onCanPlay);
-        };
-        audio.addEventListener('canplay', onCanPlay);
-        audio.src = data.stream_url;
-        audio.play().catch(() => {});
+        attachAudio(data.stream_url, t0);
 
         const poll = async () => {
           const st = await fetch(`${api}/v1/jobs/${data.job_id}`, {
@@ -104,8 +161,6 @@
           const job = await st.json();
           if (job.status === 'ready') {
             $('tReady').textContent = Math.round(performance.now() - t0);
-            const dl = job.presigned_url || job.download_url;
-            $('meta').innerHTML += `<br><a class="dl" href="${dl}" download>⬇ Download MP3</a>`;
             return;
           }
           if (job.status === 'failed') {
