@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import urllib.parse
 import urllib.request
+import time
 import uuid
 from functools import lru_cache
 from pathlib import Path
@@ -132,6 +133,8 @@ class JobStatusResponse(BaseModel):
     size_bytes: int = 0
     buffer_bytes: int = 0
     direct_ready: bool = False
+    direct_stream_url: str | None = None
+    direct_media_type: str | None = None
     download_url: str | None = None
     presigned_url: str | None = None
     error: str | None = None
@@ -362,6 +365,51 @@ def _to_mp3(source: Path, dest: Path) -> None:
         source.unlink(missing_ok=True)
 
 
+def _resolve_cache_dir(settings: Settings) -> Path:
+    path = settings.moz_download_dir / "resolve_cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _resolve_cache_path(settings: Settings, spotify_id: str) -> Path:
+    return _resolve_cache_dir(settings) / f"{spotify_id}.json"
+
+
+def _load_resolve_cache(settings: Settings, spotify_id: str) -> dict | None:
+    path = _resolve_cache_path(settings, spotify_id)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    resolved_at = float(data.get("resolved_at") or 0)
+    if data.get("direct_url") and (time.time() - resolved_at) < 3 * 3600:
+        return data
+    if data.get("youtube_video_id"):
+        return data
+    return None
+
+
+def _save_resolve_cache(
+    settings: Settings,
+    spotify_id: str,
+    *,
+    youtube_video_id: str | None,
+    direct_url: str,
+    media_type: str,
+) -> None:
+    payload = {
+        "youtube_video_id": youtube_video_id,
+        "direct_url": direct_url,
+        "media_type": media_type,
+        "resolved_at": time.time(),
+    }
+    _resolve_cache_path(settings, spotify_id).write_text(json.dumps(payload))
+
+
 def _guess_direct_media_type(url: str) -> str:
     lower = url.lower()
     if "mime=audio%2Fmp4" in lower or "mime=audio/mp4" in lower or ".m4a" in lower:
@@ -371,29 +419,74 @@ def _guess_direct_media_type(url: str) -> str:
     return "audio/mp4"
 
 
-def _ytdlp_resolve_direct_url(settings: Settings, *, query: str) -> tuple[str, str]:
-    """Resolve YouTube CDN URL via yt-dlp -g (no download)."""
+def _ytdlp_resolve_direct_url(
+    settings: Settings,
+    *,
+    query: str,
+    spotify_id: str | None = None,
+    youtube_video_id: str | None = None,
+) -> tuple[str, str, str | None]:
+    """Resolve YouTube CDN URL via yt-dlp (no download). Uses disk cache + video id."""
+    if spotify_id:
+        cached = _load_resolve_cache(settings, spotify_id)
+        if cached and cached.get("direct_url"):
+            return (
+                cached["direct_url"],
+                cached.get("media_type") or _guess_direct_media_type(cached["direct_url"]),
+                cached.get("youtube_video_id"),
+            )
+        if not youtube_video_id and cached:
+            youtube_video_id = cached.get("youtube_video_id")
+
+    target = (
+        f"https://www.youtube.com/watch?v={youtube_video_id}"
+        if youtube_video_id
+        else f"ytsearch1:{query}"
+    )
     cmd = [
         _ytdlp_bin(settings),
-        f"ytsearch1:{query}",
+        target,
         "--no-playlist",
         "-f",
         "140/ba/b",
-        "-g",
+        "--print",
+        "id",
+        "--print",
+        "url",
         *YTDLP_EXTRACT_ARGS,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45, check=False)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "yt-dlp resolve failed")[-800:])
-    line = proc.stdout.strip().split("\n")[0].strip()
-    if not line.startswith("http"):
+    lines = [line.strip() for line in proc.stdout.strip().split("\n") if line.strip()]
+    if not lines:
+        raise RuntimeError("yt-dlp returned no output")
+    resolved_id: str | None = None
+    url: str | None = None
+    for line in lines:
+        if line.startswith("http"):
+            url = line
+        elif len(line) == 11 and re.fullmatch(r"[\w-]{11}", line):
+            resolved_id = line
+    if not url:
         raise RuntimeError("yt-dlp did not return a stream URL")
-    return line, _guess_direct_media_type(line)
+    media_type = _guess_direct_media_type(url)
+    if spotify_id:
+        _save_resolve_cache(
+            settings,
+            spotify_id,
+            youtube_video_id=resolved_id or youtube_video_id,
+            direct_url=url,
+            media_type=media_type,
+        )
+    return url, media_type, resolved_id or youtube_video_id
 
 
 def _resolve_direct_worker(settings: Settings, job: PlayJob) -> None:
-    url, media_type = _ytdlp_resolve_direct_url(
-        settings, query=f"{job.artist} {job.title}"
+    url, media_type, _ = _ytdlp_resolve_direct_url(
+        settings,
+        query=f"{job.artist} {job.title}",
+        spotify_id=job.spotify_id,
     )
     job.direct_url = url
     job.direct_media_type = media_type
@@ -503,6 +596,8 @@ def _job_to_status(job: PlayJob) -> JobStatusResponse:
         size_bytes=job.size_bytes,
         buffer_bytes=buffer_bytes(job),
         direct_ready=bool(job.direct_url),
+        direct_stream_url=job.direct_url,
+        direct_media_type=job.direct_media_type if job.direct_url else None,
         download_url=job.download_url,
         presigned_url=job.presigned_url,
         error=job.error,
