@@ -29,6 +29,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from jobs import (
     PlayJob,
     find_growing_audio,
+    buffer_bytes,
     iter_stream_chunks,
     job_stem,
     job_store,
@@ -128,6 +129,7 @@ class JobStatusResponse(BaseModel):
     spotify_track_id: str
     s3_key: str
     size_bytes: int = 0
+    buffer_bytes: int = 0
     download_url: str | None = None
     presigned_url: str | None = None
     error: str | None = None
@@ -389,6 +391,8 @@ def _ytdlp_play_download(settings: Settings, job: PlayJob) -> None:
         "--no-part",
         "--concurrent-fragments",
         "4",
+        "--extractor-args",
+        "youtube:player_client=android,web",
         "-o",
         str(stem.with_suffix(".%(ext)s")),
     ]
@@ -453,6 +457,7 @@ def _job_to_status(job: PlayJob) -> JobStatusResponse:
         spotify_track_id=job.spotify_id,
         s3_key=job.s3_key,
         size_bytes=job.size_bytes,
+        buffer_bytes=buffer_bytes(job),
         download_url=job.download_url,
         presigned_url=job.presigned_url,
         error=job.error,

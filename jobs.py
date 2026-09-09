@@ -113,6 +113,17 @@ def media_type_for_path(path: Path) -> str:
     return MEDIA_TYPE_BY_SUFFIX.get(path.suffix.lower(), "audio/mpeg")
 
 
+def buffer_bytes(job: PlayJob) -> int:
+    """Bytes available for progressive stream (growing file on disk)."""
+    audio = find_growing_audio(job_stem(job))
+    if audio is None:
+        return 0
+    try:
+        return audio.stat().st_size
+    except OSError:
+        return 0
+
+
 def start_download_thread(
     job: PlayJob,
     *,
@@ -145,7 +156,7 @@ def iter_stream_chunks(job: PlayJob, *, start: int = 0, chunk_size: int = 32768)
     """Yield audio bytes while the download thread writes the temp file."""
     offset = start
     idle_rounds = 0
-    max_idle = 400
+    max_idle = 667  # ~20s at 0.03s sleep — yt-dlp extract can be slow under load
     stem = job_stem(job)
 
     while True:
