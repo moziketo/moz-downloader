@@ -90,7 +90,7 @@ class HealthResponse(BaseModel):
     ffmpeg: bool
 
 
-app = FastAPI(title="Moziketo Downloader", version="0.2.0")
+app = FastAPI(title="Moziketo Downloader", version="0.3.0")
 
 
 def _verify_secret(
@@ -116,11 +116,25 @@ def _spotify_track_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _safe_key(name: str | None, *, spotify_id: str | None) -> str:
+def _slugify(*parts: str) -> str:
+    raw = "-".join(p.strip() for p in parts if p and p.strip())
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw).strip("-._").lower()
+    return slug or uuid.uuid4().hex
+
+
+def _safe_key(
+    name: str | None,
+    *,
+    spotify_id: str | None,
+    title: str | None = None,
+    artist: str | None = None,
+) -> str:
     if name:
         base = re.sub(r"[^a-zA-Z0-9._-]+", "-", name.strip()).strip("-._")
         if base:
             return base if base.endswith(".mp3") else f"{base}.mp3"
+    if title and artist:
+        return f"{_slugify(artist, title)}.mp3"
     if spotify_id:
         return f"{spotify_id}.mp3"
     return f"{uuid.uuid4().hex}.mp3"
@@ -133,6 +147,53 @@ def _ytdlp_bin(settings: Settings) -> str:
     if found:
         return found
     raise RuntimeError("yt-dlp not found")
+
+
+def _http_json(url: str, *, headers: dict[str, str] | None = None) -> dict:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; MoziketoDownloader/0.3)",
+            "Accept": "application/json",
+            **(headers or {}),
+        },
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        return json.loads(resp.read())
+
+
+def _spotify_oembed_metadata(url: str) -> tuple[str | None, str | None]:
+    """Public Spotify oEmbed — title only (no auth, works from IR VPS)."""
+    oembed_url = (
+        "https://open.spotify.com/oembed?"
+        + urllib.parse.urlencode({"url": url.split("?", 1)[0]})
+    )
+    try:
+        data = _http_json(oembed_url)
+    except Exception:
+        return None, None
+    title = str(data.get("title") or "").strip() or None
+    return title, None
+
+
+def _spotify_embed_metadata(track_id: str) -> tuple[str | None, str | None]:
+    """Parse embed page JSON — track + artist names."""
+    embed_url = f"https://open.spotify.com/embed/track/{track_id}"
+    req = urllib.request.Request(
+        embed_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; MoziketoDownloader/0.3)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None, None
+    names = re.findall(r'"name":"([^"]+)"', html)
+    if len(names) >= 2:
+        return names[0].strip() or None, names[1].strip() or None
+    if len(names) == 1:
+        return names[0].strip() or None, None
+    return None, None
 
 
 def _spotify_api_metadata(settings: Settings, track_id: str) -> tuple[str | None, str | None]:
@@ -176,15 +237,27 @@ def _resolve_metadata(
     if title_hint and artist_hint:
         return title_hint.strip(), artist_hint.strip()
 
-    if track_id:
-        title, artist = _spotify_api_metadata(settings, track_id)
-        if title and artist:
-            return title, artist
+    title: str | None = title_hint.strip() if title_hint else None
+    artist: str | None = artist_hint.strip() if artist_hint else None
 
-    raise RuntimeError(
-        "Could not resolve Spotify metadata — pass title and artist, "
-        "or configure SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET"
-    )
+    if track_id and (not title or not artist):
+        api_title, api_artist = _spotify_api_metadata(settings, track_id)
+        title = title or api_title
+        artist = artist or api_artist
+
+    if not title or not artist:
+        oembed_title, _ = _spotify_oembed_metadata(url)
+        title = title or oembed_title
+
+    if track_id and (not title or not artist):
+        embed_title, embed_artist = _spotify_embed_metadata(track_id)
+        title = title or embed_title
+        artist = artist or embed_artist
+
+    if title and artist:
+        return title, artist
+
+    raise RuntimeError("Could not resolve Spotify track metadata from URL")
 
 
 def _download_spotify(
@@ -273,9 +346,6 @@ def _ingest_sync(
             detail="Only Spotify track URLs are supported",
         )
 
-    filename = _safe_key(key_hint, spotify_id=spotify_id)
-    s3_key = f"music/{filename}"
-
     settings.moz_download_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="moz-ingest-", dir=settings.moz_download_dir) as tmp:
         tmp_path = Path(tmp)
@@ -286,6 +356,8 @@ def _ingest_sync(
             title_hint=title_hint,
             artist_hint=artist_hint,
         )
+        filename = _safe_key(key_hint, spotify_id=spotify_id, title=title, artist=artist)
+        s3_key = f"music/{filename}"
         download_url, presigned_url = _upload_s3(settings, local_path=local_file, key=s3_key)
 
         return IngestResponse(

@@ -40,14 +40,11 @@ All routes require header `X-Moziketo-Relay-Secret`.
 
 ```json
 {
-  "url": "https://open.spotify.com/track/...",
-  "title": "Track title",
-  "artist": "Artist name",
-  "key": "slug.mp3"
+  "url": "https://open.spotify.com/track/..."
 }
 ```
 
-`title` + `artist` are required unless `SPOTIFY_CLIENT_ID/SECRET` is configured (Spotify Web API metadata).
+Only the Spotify URL is required — title/artist are resolved automatically via Spotify oEmbed + embed page. Optional: `key` (S3 filename), `title`, `artist` overrides.
 
 ### Response
 
