@@ -1,0 +1,4 @@
+# spotdl bundle includes yt-dlp + uvicorn + fastapi (pinned versions)
+spotdl>=4.2.0
+boto3>=1.35.0
+pydantic-settings>=2.6.0

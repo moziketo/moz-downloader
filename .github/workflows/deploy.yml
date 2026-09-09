@@ -1,0 +1,50 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-moz-downloader
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy to moz-downloader
+        run: |
+          HOST="${{ secrets.DOWNLOADER_DEPLOY_HOST }}"
+          USER="${{ secrets.DOWNLOADER_DEPLOY_USER }}"
+          ssh -o StrictHostKeyChecking=accept-new "${USER}@${HOST}" \
+            "mkdir -p /opt/moz-downloader /var/lib/moz-downloader/cache"
+          scp server.py requirements.txt .env.example "${USER}@${HOST}:/opt/moz-downloader/"
+          scp deploy/moz-downloader.service "${USER}@${HOST}:/tmp/moz-downloader.service"
+          ssh "${USER}@${HOST}" bash -s <<'EOF'
+          set -euo pipefail
+          cd /opt/moz-downloader
+          if [ ! -d venv ]; then python3 -m venv venv; fi
+          ./venv/bin/pip install -q --upgrade pip
+          ./venv/bin/pip install -q -r requirements.txt
+          test -f .env || cp .env.example .env 2>/dev/null || true
+          sudo mv /tmp/moz-downloader.service /etc/systemd/system/moz-downloader.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable moz-downloader
+          sudo systemctl restart moz-downloader
+          sleep 2
+          sudo systemctl is-active moz-downloader
+          EOF
