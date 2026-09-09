@@ -26,7 +26,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from jobs import PlayJob, iter_stream_chunks, job_store, start_download_thread
+from jobs import (
+    PlayJob,
+    find_growing_audio,
+    iter_stream_chunks,
+    job_stem,
+    job_store,
+    media_type_for_path,
+    start_download_thread,
+)
 
 logger = logging.getLogger("moz-downloader")
 
@@ -293,11 +301,6 @@ def _resolve_metadata(
     title: str | None = title_hint.strip() if title_hint else None
     artist: str | None = artist_hint.strip() if artist_hint else None
 
-    if track_id and (not title or not artist):
-        api_title, api_artist = _spotify_api_metadata(settings, track_id)
-        title = title or api_title
-        artist = artist or api_artist
-
     if not title or not artist:
         oembed_title, _ = _spotify_oembed_metadata(url)
         title = title or oembed_title
@@ -306,6 +309,11 @@ def _resolve_metadata(
         embed_title, embed_artist = _spotify_embed_metadata(track_id)
         title = title or embed_title
         artist = artist or embed_artist
+
+    if track_id and (not title or not artist):
+        api_title, api_artist = _spotify_api_metadata(settings, track_id)
+        title = title or api_title
+        artist = artist or api_artist
 
     if title and artist:
         return title, artist
@@ -317,33 +325,84 @@ def _resolve_metadata(
     raise RuntimeError("Could not resolve Spotify track metadata from URL")
 
 
+def _resolve_downloaded_file(stem: Path, *, final_mp3: Path) -> Path:
+    if final_mp3.is_file():
+        return final_mp3
+    found = find_growing_audio(stem)
+    if found is None:
+        raise RuntimeError("yt-dlp produced no audio file")
+    return found
+
+
+def _to_mp3(source: Path, dest: Path) -> None:
+    if source.suffix.lower() == ".mp3":
+        if source != dest:
+            shutil.move(str(source), str(dest))
+        return
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        shutil.move(str(source), str(dest))
+        return
+    proc = subprocess.run(
+        [ffmpeg, "-y", "-i", str(source), "-vn", "-codec:a", "libmp3lame", "-q:a", "4", str(dest)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr[-800:] or "ffmpeg mp3 convert failed")
+    if source != dest and source.is_file():
+        source.unlink(missing_ok=True)
+
+
 def _ytdlp_to_file(settings: Settings, *, query: str, out_path: Path) -> None:
+    """Blocking ingest — full mp3 for S3 upload."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    stem = out_path.with_suffix("")
     cmd = [
         _ytdlp_bin(settings),
         f"ytsearch1:{query}",
         "--no-playlist",
-        "-x",
-        "--audio-format",
-        "mp3",
-        "--audio-quality",
-        "0",
+        "-f",
+        "ba/b",
+        "--no-part",
         "-o",
-        str(out_path.with_suffix(".%(ext)s")),
+        str(stem.with_suffix(".%(ext)s")),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr[-800:] or proc.stdout[-800:] or "yt-dlp failed")
-    if out_path.is_file():
-        return
-    files = sorted(
-        out_path.parent.glob(out_path.stem + ".*"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+    downloaded = _resolve_downloaded_file(stem, final_mp3=out_path)
+    _to_mp3(downloaded, out_path)
+
+
+def _ytdlp_play_download(settings: Settings, job: PlayJob) -> None:
+    """Progressive best-audio download — file grows while stream reads."""
+    stem = job_stem(job)
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        _ytdlp_bin(settings),
+        f"ytsearch1:{job.artist} {job.title}",
+        "--no-playlist",
+        "-f",
+        "ba/b",
+        "--no-part",
+        "--concurrent-fragments",
+        "4",
+        "-o",
+        str(stem.with_suffix(".%(ext)s")),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
     )
-    if not files:
-        raise RuntimeError("yt-dlp produced no mp3 file")
-    shutil.move(str(files[0]), str(out_path))
+    _, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError((stderr or "")[-800:] or "yt-dlp failed")
+    downloaded = _resolve_downloaded_file(stem, final_mp3=job.temp_path)
+    _to_mp3(downloaded, job.temp_path)
 
 
 def _download_spotify(
@@ -369,7 +428,7 @@ def _download_spotify(
 
 
 def _download_job_file(settings: Settings, job: PlayJob) -> None:
-    _ytdlp_to_file(settings, query=f"{job.artist} {job.title}", out_path=job.temp_path)
+    _ytdlp_play_download(settings, job)
 
 
 def _upload_job_file(settings: Settings, job: PlayJob) -> tuple[str, str | None]:
@@ -560,15 +619,18 @@ async def stream_job(
 
     start = 0
     range_header = request.headers.get("range")
-    if range_header and job.temp_path.exists():
+    stem = job_stem(job)
+    active = find_growing_audio(stem)
+    if range_header and active is not None:
         try:
-            start, _ = _parse_range_header(range_header, job.temp_path.stat().st_size)
+            start, _ = _parse_range_header(range_header, active.stat().st_size)
         except ValueError:
             start = 0
 
     def _generator():
         yield from iter_stream_chunks(job, start=start)
 
+    media_type = media_type_for_path(active or job.temp_path)
     headers = {
         "Accept-Ranges": "bytes",
         "Cache-Control": "no-cache",
@@ -579,11 +641,11 @@ async def stream_job(
         return StreamingResponse(
             _generator(),
             status_code=206,
-            media_type="audio/mpeg",
+            media_type=media_type,
             headers=headers,
         )
 
-    return StreamingResponse(_generator(), media_type="audio/mpeg", headers=headers)
+    return StreamingResponse(_generator(), media_type=media_type, headers=headers)
 
 
 @app.post("/v1/ingest", response_model=IngestResponse, dependencies=[Depends(_verify_secret)])
