@@ -20,9 +20,13 @@ from pathlib import Path
 
 import boto3
 from botocore.config import Config
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from jobs import PlayJob, iter_stream_chunks, job_store, start_download_thread
 
 logger = logging.getLogger("moz-downloader")
 
@@ -90,7 +94,49 @@ class HealthResponse(BaseModel):
     ffmpeg: bool
 
 
-app = FastAPI(title="Moziketo Downloader", version="0.3.0")
+class PlayRequest(BaseModel):
+    url: HttpUrl
+    title: str | None = Field(default=None, max_length=300)
+    artist: str | None = Field(default=None, max_length=300)
+    key: str | None = Field(default=None, max_length=200)
+
+
+class PlayResponse(BaseModel):
+    status: str = "starting"
+    job_id: str
+    stream_url: str
+    status_url: str
+    title: str
+    artist: str
+    spotify_track_id: str
+    s3_key: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    title: str
+    artist: str
+    spotify_track_id: str
+    s3_key: str
+    size_bytes: int = 0
+    download_url: str | None = None
+    presigned_url: str | None = None
+    error: str | None = None
+
+
+app = FastAPI(title="Moziketo Downloader", version="0.4.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://pwa.moziketo.ir",
+        "https://moziketo.ir",
+        "http://localhost:3000",
+    ],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
 def _verify_secret(
@@ -260,6 +306,35 @@ def _resolve_metadata(
     raise RuntimeError("Could not resolve Spotify track metadata from URL")
 
 
+def _ytdlp_to_file(settings: Settings, *, query: str, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        _ytdlp_bin(settings),
+        f"ytsearch1:{query}",
+        "--no-playlist",
+        "-x",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        "0",
+        "-o",
+        str(out_path.with_suffix(".%(ext)s")),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr[-800:] or proc.stdout[-800:] or "yt-dlp failed")
+    if out_path.is_file():
+        return
+    files = sorted(
+        out_path.parent.glob(out_path.stem + ".*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not files:
+        raise RuntimeError("yt-dlp produced no mp3 file")
+    shutil.move(str(files[0]), str(out_path))
+
+
 def _download_spotify(
     settings: Settings,
     url: str,
@@ -277,30 +352,41 @@ def _download_spotify(
         title_hint=title_hint,
         artist_hint=artist_hint,
     )
-    query = f"{artist} {title}"
-
     out_path = dest_dir / "audio.mp3"
-    cmd = [
-        _ytdlp_bin(settings),
-        f"ytsearch1:{query}",
-        "--no-playlist",
-        "-x",
-        "--audio-format",
-        "mp3",
-        "--audio-quality",
-        "0",
-        "-o",
-        str(out_path.with_suffix(".%(ext)s")),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr[-800:] or proc.stdout[-800:] or "yt-dlp failed")
-    if out_path.is_file():
-        return out_path, title, artist
-    files = sorted(dest_dir.glob("audio.*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        raise RuntimeError("yt-dlp produced no mp3 file")
-    return files[0], title, artist
+    _ytdlp_to_file(settings, query=f"{artist} {title}", out_path=out_path)
+    return out_path, title, artist
+
+
+def _download_job_file(settings: Settings, job: PlayJob) -> None:
+    _ytdlp_to_file(settings, query=f"{job.artist} {job.title}", out_path=job.temp_path)
+
+
+def _upload_job_file(settings: Settings, job: PlayJob) -> tuple[str, str | None]:
+    return _upload_s3(settings, local_path=job.temp_path, key=job.s3_key)
+
+
+def _parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
+    if not range_header.startswith("bytes="):
+        raise ValueError("unsupported range")
+    start_s, _, end_s = range_header.removeprefix("bytes=").partition("-")
+    start = int(start_s) if start_s else 0
+    end = int(end_s) if end_s else max(file_size - 1, start)
+    return start, min(end, max(file_size - 1, start))
+
+
+def _job_to_status(job: PlayJob) -> JobStatusResponse:
+    return JobStatusResponse(
+        job_id=job.job_id,
+        status=job.status,
+        title=job.title,
+        artist=job.artist,
+        spotify_track_id=job.spotify_id,
+        s3_key=job.s3_key,
+        size_bytes=job.size_bytes,
+        download_url=job.download_url,
+        presigned_url=job.presigned_url,
+        error=job.error,
+    )
 
 
 def _upload_s3(settings: Settings, *, local_path: Path, key: str) -> tuple[str, str | None]:
@@ -381,6 +467,112 @@ async def health() -> HealthResponse:
         ytdlp=Path(settings.moz_ytdlp).is_file() or shutil.which("yt-dlp") is not None,
         ffmpeg=shutil.which("ffmpeg") is not None,
     )
+
+
+@app.post("/v1/play", response_model=PlayResponse, dependencies=[Depends(_verify_secret)])
+async def play(body: PlayRequest, request: Request) -> PlayResponse:
+    """Start download in background; return stream URL immediately (~1s)."""
+    settings = get_settings()
+    url = str(body.url).split("?", 1)[0]
+    spotify_id = _spotify_track_id(url)
+    if spotify_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only Spotify track URLs are supported",
+        )
+
+    try:
+        title, artist = await asyncio.to_thread(
+            _resolve_metadata,
+            settings,
+            url=url,
+            track_id=spotify_id,
+            title_hint=body.title,
+            artist_hint=body.artist,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)[:500]) from exc
+
+    filename = _safe_key(body.key, spotify_id=spotify_id, title=title, artist=artist)
+    s3_key = f"music/{filename}"
+    jobs_dir = settings.moz_download_dir / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = jobs_dir / f"{uuid.uuid4().hex}.mp3"
+
+    job = job_store.create(
+        spotify_url=url,
+        spotify_id=spotify_id,
+        title=title,
+        artist=artist,
+        s3_key=s3_key,
+        temp_path=temp_path,
+    )
+    start_download_thread(
+        job,
+        download_fn=lambda j: _download_job_file(settings, j),
+        upload_fn=lambda j: _upload_job_file(settings, j),
+    )
+
+    base = str(request.base_url).rstrip("/")
+    stream_url = f"{base}/v1/stream/{job.job_id}?token={job.stream_token}"
+    status_url = f"{base}/v1/jobs/{job.job_id}"
+
+    return PlayResponse(
+        job_id=job.job_id,
+        stream_url=stream_url,
+        status_url=status_url,
+        title=title,
+        artist=artist,
+        spotify_track_id=spotify_id,
+        s3_key=s3_key,
+    )
+
+
+@app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse, dependencies=[Depends(_verify_secret)])
+async def job_status(job_id: str) -> JobStatusResponse:
+    job = job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return _job_to_status(job)
+
+
+@app.get("/v1/stream/{job_id}")
+async def stream_job(
+    job_id: str,
+    request: Request,
+    token: str | None = Query(default=None),
+):
+    """Stream MP3 while download runs. Token in query for HTML5 audio."""
+    job = job_store.verify_stream(job_id, token)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    start = 0
+    range_header = request.headers.get("range")
+    if range_header and job.temp_path.exists():
+        try:
+            start, _ = _parse_range_header(range_header, job.temp_path.stat().st_size)
+        except ValueError:
+            start = 0
+
+    def _generator():
+        yield from iter_stream_chunks(job, start=start)
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache",
+        "Content-Disposition": f'inline; filename="{job.s3_key.rsplit("/", 1)[-1]}"',
+    }
+    if range_header and start > 0:
+        headers["Content-Range"] = f"bytes {start}-*/"
+        return StreamingResponse(
+            _generator(),
+            status_code=206,
+            media_type="audio/mpeg",
+            headers=headers,
+        )
+
+    return StreamingResponse(_generator(), media_type="audio/mpeg", headers=headers)
 
 
 @app.post("/v1/ingest", response_model=IngestResponse, dependencies=[Depends(_verify_secret)])
