@@ -25,6 +25,55 @@ MEDIA_TYPE_BY_SUFFIX = {
 }
 
 
+class ByteBroadcast:
+    """Thread-safe growing buffer — yt-dlp pipe feeds, HTTP stream reads in chunks."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._buf = bytearray()
+        self._closed = False
+        self._error: str | None = None
+
+    def feed(self, data: bytes) -> None:
+        if not data:
+            return
+        with self._cv:
+            self._buf.extend(data)
+            self._cv.notify_all()
+
+    def close(self, error: str | None = None) -> None:
+        with self._cv:
+            self._closed = True
+            self._error = error
+            self._cv.notify_all()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._buf)
+
+    def iter_chunks(self, *, start: int = 0, chunk_size: int = 16384):
+        offset = start
+        idle = 0
+        max_idle = 667
+        while True:
+            with self._cv:
+                while offset >= len(self._buf) and not self._closed:
+                    self._cv.wait(timeout=0.03)
+                    idle += 1
+                    if idle > max_idle:
+                        raise TimeoutError("pipe stream timed out waiting for audio")
+                if offset >= len(self._buf):
+                    if self._error:
+                        raise RuntimeError(self._error)
+                    break
+                end = min(offset + chunk_size, len(self._buf))
+                chunk = bytes(self._buf[offset:end])
+                offset = end
+                idle = 0
+            yield chunk
+
+
 @dataclass
 class PlayJob:
     job_id: str
@@ -44,6 +93,8 @@ class PlayJob:
     error: str | None = None
     direct_ready: threading.Event = field(default_factory=threading.Event)
     download_done: threading.Event = field(default_factory=threading.Event)
+    pipe_media_type: str = "audio/mp4"
+    broadcast: ByteBroadcast = field(default_factory=lambda: ByteBroadcast())
     _thread: threading.Thread | None = field(default=None, repr=False)
     _resolve_thread: threading.Thread | None = field(default=None, repr=False)
 
@@ -118,7 +169,10 @@ def media_type_for_path(path: Path) -> str:
 
 
 def buffer_bytes(job: PlayJob) -> int:
-    """Bytes available for progressive stream (growing file on disk)."""
+    """Bytes available for progressive stream (pipe buffer or growing file)."""
+    pipe_len = len(job.broadcast)
+    if pipe_len > 0:
+        return pipe_len
     audio = find_growing_audio(job_stem(job))
     if audio is None:
         return 0
@@ -126,6 +180,20 @@ def buffer_bytes(job: PlayJob) -> int:
         return audio.stat().st_size
     except OSError:
         return 0
+
+
+def iter_pipe_or_file_chunks(
+    job: PlayJob, *, start: int = 0, chunk_size: int = 16384
+):
+    """Prefer in-memory pipe chunks; fall back to growing file on disk."""
+    if not job.download_done.is_set() or len(job.broadcast) > 0:
+        try:
+            yield from job.broadcast.iter_chunks(start=start, chunk_size=chunk_size)
+            return
+        except TimeoutError:
+            if job.status == "failed":
+                raise RuntimeError(job.error or "download failed") from None
+    yield from iter_stream_chunks(job, start=start, chunk_size=chunk_size)
 
 
 def start_resolve_thread(job: PlayJob, *, resolve_fn: Callable[[PlayJob], None]) -> None:

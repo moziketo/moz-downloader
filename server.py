@@ -31,6 +31,7 @@ from jobs import (
     PlayJob,
     buffer_bytes,
     find_growing_audio,
+    iter_pipe_or_file_chunks,
     iter_stream_chunks,
     job_stem,
     job_store,
@@ -515,35 +516,61 @@ def _ytdlp_to_file(settings: Settings, *, query: str, out_path: Path) -> None:
     _to_mp3(downloaded, out_path)
 
 
+def _ytdlp_target_for_job(settings: Settings, job: PlayJob) -> str:
+    cached = _load_resolve_cache(settings, job.spotify_id)
+    video_id = cached.get("youtube_video_id") if cached else None
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return f"ytsearch1:{job.artist} {job.title}"
+
+
 def _ytdlp_play_download(settings: Settings, job: PlayJob) -> None:
-    """Progressive best-audio download — file grows while stream reads."""
+    """Pipe download — tee stdout to broadcast buffer + disk (chunked play)."""
     stem = job_stem(job)
     stem.parent.mkdir(parents=True, exist_ok=True)
+    target = _ytdlp_target_for_job(settings, job)
     cmd = [
         _ytdlp_bin(settings),
-        f"ytsearch1:{job.artist} {job.title}",
+        target,
         "--no-playlist",
         "-f",
-        "ba/b",
-        "--no-part",
+        "140/ba/b",
         "--concurrent-fragments",
         "4",
-        "--extractor-args",
-        "youtube:player_client=android,web",
+        *YTDLP_EXTRACT_ARGS,
         "-o",
-        str(stem.with_suffix(".%(ext)s")),
+        "-",
     ]
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
     )
-    _, stderr = proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError((stderr or "")[-800:] or "yt-dlp failed")
-    downloaded = _resolve_downloaded_file(stem, final_mp3=job.temp_path)
-    _to_mp3(downloaded, job.temp_path)
+    raw_path = stem.with_suffix(".m4a")
+    job.pipe_media_type = "audio/mp4"
+    stderr = b""
+    try:
+        assert proc.stdout is not None
+        with raw_path.open("wb") as fh:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                job.broadcast.feed(chunk)
+                fh.write(chunk)
+    except Exception as exc:
+        job.broadcast.close(str(exc)[:500])
+        raise
+    finally:
+        if proc.stderr is not None:
+            stderr = proc.stderr.read()
+        rc = proc.wait()
+        job.broadcast.close()
+        if rc != 0:
+            raise RuntimeError((stderr.decode(errors="replace") or "yt-dlp pipe failed")[-800:])
+    if not raw_path.is_file() or raw_path.stat().st_size == 0:
+        raise RuntimeError("yt-dlp pipe produced no audio")
+    _to_mp3(raw_path, job.temp_path)
 
 
 def _download_spotify(
@@ -765,7 +792,7 @@ async def stream_job(
     request: Request,
     token: str | None = Query(default=None),
 ):
-    """Proxy YouTube CDN URL (fast) or fall back to growing file on disk."""
+    """CDN proxy when ready, else chunked pipe from yt-dlp stdout (play while downloading)."""
     job = job_store.verify_stream(job_id, token)
     if job is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
@@ -778,7 +805,7 @@ async def stream_job(
         "Content-Disposition": f'inline; filename="{filename}"',
     }
 
-    direct_url = await asyncio.to_thread(_wait_for_direct, job)
+    direct_url = await asyncio.to_thread(lambda: _wait_for_direct(job, timeout=0.8))
     if direct_url:
         upstream_headers = {"User-Agent": "Mozilla/5.0 (compatible; MoziketoDownloader/0.5)"}
         if range_header:
@@ -812,28 +839,26 @@ async def stream_job(
         )
 
     start = 0
-    stem = job_stem(job)
-    active = find_growing_audio(stem)
-    if range_header and active is not None:
+    if range_header and len(job.broadcast) > 0:
         try:
-            start, _ = _parse_range_header(range_header, active.stat().st_size)
+            start, _ = _parse_range_header(range_header, len(job.broadcast))
         except ValueError:
             start = 0
 
-    def _file_gen():
-        yield from iter_stream_chunks(job, start=start)
+    def _chunk_gen():
+        yield from iter_pipe_or_file_chunks(job, start=start)
 
-    media_type = media_type_for_path(active or job.temp_path)
+    media_type = job.pipe_media_type
     if range_header and start > 0:
         headers["Content-Range"] = f"bytes {start}-*/"
         return StreamingResponse(
-            _file_gen(),
+            _chunk_gen(),
             status_code=206,
             media_type=media_type,
             headers=headers,
         )
 
-    return StreamingResponse(_file_gen(), media_type=media_type, headers=headers)
+    return StreamingResponse(_chunk_gen(), media_type=media_type, headers=headers)
 
 
 @app.post("/v1/ingest", response_model=IngestResponse, dependencies=[Depends(_verify_secret)])
