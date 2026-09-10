@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import urllib.parse
 import urllib.request
+import threading
 import time
 import uuid
 from functools import lru_cache
@@ -524,8 +525,28 @@ def _ytdlp_target_for_job(settings: Settings, job: PlayJob) -> str:
     return f"ytsearch1:{job.artist} {job.title}"
 
 
+def _feed_broadcast_from_file(job: PlayJob, stem: Path, proc: subprocess.Popen) -> None:
+    """Mirror growing file bytes into broadcast buffer while yt-dlp downloads."""
+    offset = 0
+    try:
+        while proc.poll() is None:
+            audio = find_growing_audio(stem)
+            if audio is not None:
+                size = audio.stat().st_size
+                if size > offset:
+                    with audio.open("rb") as fh:
+                        fh.seek(offset)
+                        chunk = fh.read(16384)
+                        if chunk:
+                            job.broadcast.feed(chunk)
+                            offset += len(chunk)
+            time.sleep(0.05)
+    finally:
+        job.broadcast.close()
+
+
 def _ytdlp_play_download(settings: Settings, job: PlayJob) -> None:
-    """Pipe download — tee stdout to broadcast buffer + disk (chunked play)."""
+    """Progressive download — file grows on disk, mirrored to broadcast in 16KB chunks."""
     stem = job_stem(job)
     stem.parent.mkdir(parents=True, exist_ok=True)
     target = _ytdlp_target_for_job(settings, job)
@@ -535,42 +556,28 @@ def _ytdlp_play_download(settings: Settings, job: PlayJob) -> None:
         "--no-playlist",
         "-f",
         "140/ba/b",
+        "--no-part",
         "--concurrent-fragments",
         "4",
         *YTDLP_EXTRACT_ARGS,
         "-o",
-        "-",
+        str(stem.with_suffix(".%(ext)s")),
     ]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    feeder = threading.Thread(
+        target=_feed_broadcast_from_file,
+        args=(job, stem, proc),
+        name=f"moz-feed-{job.job_id[:8]}",
+        daemon=True,
     )
-    raw_path = stem.with_suffix(".m4a")
-    job.pipe_media_type = "audio/mp4"
-    stderr = b""
-    try:
-        assert proc.stdout is not None
-        with raw_path.open("wb") as fh:
-            while True:
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    break
-                job.broadcast.feed(chunk)
-                fh.write(chunk)
-    except Exception as exc:
-        job.broadcast.close(str(exc)[:500])
-        raise
-    finally:
-        if proc.stderr is not None:
-            stderr = proc.stderr.read()
-        rc = proc.wait()
-        job.broadcast.close()
-        if rc != 0:
-            raise RuntimeError((stderr.decode(errors="replace") or "yt-dlp pipe failed")[-800:])
-    if not raw_path.is_file() or raw_path.stat().st_size == 0:
-        raise RuntimeError("yt-dlp pipe produced no audio")
-    _to_mp3(raw_path, job.temp_path)
+    feeder.start()
+    _, stderr = proc.communicate()
+    feeder.join(timeout=10)
+    if proc.returncode != 0:
+        raise RuntimeError((stderr or "")[-800:] or "yt-dlp failed")
+    downloaded = _resolve_downloaded_file(stem, final_mp3=job.temp_path)
+    job.pipe_media_type = media_type_for_path(downloaded)
+    _to_mp3(downloaded, job.temp_path)
 
 
 def _download_spotify(
