@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from jobs import (
+    PLAY_BUFFER_BYTES,
     PlayJob,
     buffer_bytes,
     find_growing_audio,
@@ -37,9 +38,12 @@ from jobs import (
     job_stem,
     job_store,
     media_type_for_path,
+    play_ready,
     start_download_thread,
     start_resolve_thread,
 )
+from ytmusic_match import find_ytm_match
+from ytdlp_resolve import resolve_stream_url
 
 logger = logging.getLogger("moz-downloader")
 
@@ -112,6 +116,13 @@ class PlayRequest(BaseModel):
     title: str | None = Field(default=None, max_length=300)
     artist: str | None = Field(default=None, max_length=300)
     key: str | None = Field(default=None, max_length=200)
+    duration_ms: int | None = Field(default=None, ge=0)
+    isrc: str | None = Field(default=None, max_length=20)
+    youtube_video_id: str | None = Field(default=None, max_length=20)
+    prepare_only: bool = Field(
+        default=False,
+        description="Resolve CDN URL only (no file download). Used during search warm-up.",
+    )
 
 
 class PlayResponse(BaseModel):
@@ -134,6 +145,8 @@ class JobStatusResponse(BaseModel):
     s3_key: str
     size_bytes: int = 0
     buffer_bytes: int = 0
+    play_ready: bool = False
+    youtube_video_id: str | None = None
     direct_ready: bool = False
     direct_stream_url: str | None = None
     direct_media_type: str | None = None
@@ -142,7 +155,21 @@ class JobStatusResponse(BaseModel):
     error: str | None = None
 
 
-app = FastAPI(title="Moziketo Downloader", version="0.5.0")
+def _warm_ytdlp_extractor() -> None:
+    """Prime Deno/EJS + player cache so first user resolve is ~1s not ~1.7s."""
+    try:
+        resolve_stream_url(youtube_video_id="jNQXAC9IVRw")  # short public video
+        logger.info("yt-dlp extractor warmed on startup")
+    except Exception as exc:
+        logger.warning("yt-dlp warm-up failed (non-fatal): %s", exc)
+
+
+app = FastAPI(title="Moziketo Downloader", version="0.6.0")
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    threading.Thread(target=_warm_ytdlp_extractor, name="moz-ytdlp-warm", daemon=True).start()
 
 app.add_middleware(
     CORSMiddleware,
@@ -207,7 +234,18 @@ def _safe_key(
     return f"{uuid.uuid4().hex}.mp3"
 
 
-YTDLP_EXTRACT_ARGS = ["--extractor-args", "youtube:player_client=android,web"]
+YTDLP_EXTRACT_ARGS = [
+    "--extractor-args",
+    "youtube:player_client=android",
+    "--js-runtimes",
+    "deno:/usr/local/bin/deno",
+]
+DIRECT_URL_CACHE_TTL = 45 * 60  # googlevideo URLs expire; refresh via re-resolve
+VIDEO_ID_CACHE_TTL = 7 * 24 * 3600
+STREAM_DIRECT_WAIT = 0.4  # brief wait for hot cache; pipe/download serves cold clicks
+YTM_LOOKUP_TIMEOUT = 45.0
+# Parallel yt-dlp resolves contend on CPU/YouTube — cap concurrency.
+_resolve_semaphore = threading.Semaphore(2)
 
 
 def _ytdlp_bin(settings: Settings) -> str:
@@ -388,9 +426,10 @@ def _load_resolve_cache(settings: Settings, spotify_id: str) -> dict | None:
     if not isinstance(data, dict):
         return None
     resolved_at = float(data.get("resolved_at") or 0)
-    if data.get("direct_url") and (time.time() - resolved_at) < 3 * 3600:
+    age = time.time() - resolved_at
+    if data.get("direct_url") and age < DIRECT_URL_CACHE_TTL:
         return data
-    if data.get("youtube_video_id"):
+    if data.get("youtube_video_id") and age < VIDEO_ID_CACHE_TTL:
         return data
     return None
 
@@ -410,6 +449,60 @@ def _save_resolve_cache(
         "resolved_at": time.time(),
     }
     _resolve_cache_path(settings, spotify_id).write_text(json.dumps(payload))
+
+
+def _peek_video_id_cache(settings: Settings, spotify_id: str) -> str | None:
+    cached = _load_resolve_cache(settings, spotify_id)
+    if cached and cached.get("youtube_video_id"):
+        return cached["youtube_video_id"]
+    return None
+
+
+def _save_video_id_cache(
+    settings: Settings,
+    spotify_id: str,
+    *,
+    youtube_video_id: str,
+) -> None:
+    existing = _load_resolve_cache(settings, spotify_id) or {}
+    payload = {
+        "youtube_video_id": youtube_video_id,
+        "direct_url": existing.get("direct_url"),
+        "media_type": existing.get("media_type"),
+        "resolved_at": time.time(),
+    }
+    _resolve_cache_path(settings, spotify_id).write_text(json.dumps(payload))
+
+
+def _lookup_youtube_video_id(
+    settings: Settings,
+    *,
+    spotify_id: str,
+    title: str,
+    artist: str,
+    duration_ms: int | None = None,
+    isrc: str | None = None,
+    youtube_video_id: str | None = None,
+) -> str | None:
+    if youtube_video_id:
+        _save_video_id_cache(settings, spotify_id, youtube_video_id=youtube_video_id)
+        return youtube_video_id
+    cached = _load_resolve_cache(settings, spotify_id)
+    if cached and cached.get("youtube_video_id"):
+        return cached["youtube_video_id"]
+    try:
+        match = find_ytm_match(
+            title=title,
+            artist=artist,
+            duration_ms=duration_ms,
+            isrc=isrc,
+        )
+    except Exception as exc:
+        logger.warning("YTM lookup failed for %s: %s", spotify_id, exc)
+        return None
+    _save_video_id_cache(settings, spotify_id, youtube_video_id=match.video_id)
+    logger.info("YTM match %s → %s (%s)", spotify_id, match.video_id, match.title)
+    return match.video_id
 
 
 def _guess_direct_media_type(url: str) -> str:
@@ -440,38 +533,11 @@ def _ytdlp_resolve_direct_url(
         if not youtube_video_id and cached:
             youtube_video_id = cached.get("youtube_video_id")
 
-    target = (
-        f"https://www.youtube.com/watch?v={youtube_video_id}"
-        if youtube_video_id
-        else f"ytsearch1:{query}"
-    )
-    cmd = [
-        _ytdlp_bin(settings),
-        target,
-        "--no-playlist",
-        "-f",
-        "140/ba/b",
-        "--print",
-        "id",
-        "--print",
-        "url",
-        *YTDLP_EXTRACT_ARGS,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout or "yt-dlp resolve failed")[-800:])
-    lines = [line.strip() for line in proc.stdout.strip().split("\n") if line.strip()]
-    if not lines:
-        raise RuntimeError("yt-dlp returned no output")
-    resolved_id: str | None = None
-    url: str | None = None
-    for line in lines:
-        if line.startswith("http"):
-            url = line
-        elif len(line) == 11 and re.fullmatch(r"[\w-]{11}", line):
-            resolved_id = line
-    if not url:
-        raise RuntimeError("yt-dlp did not return a stream URL")
+    with _resolve_semaphore:
+        url, resolved_id = resolve_stream_url(
+            youtube_video_id=youtube_video_id,
+            query=None if youtube_video_id else query,
+        )
     media_type = _guess_direct_media_type(url)
     if spotify_id:
         _save_resolve_cache(
@@ -484,16 +550,82 @@ def _ytdlp_resolve_direct_url(
     return url, media_type, resolved_id or youtube_video_id
 
 
+def _ytm_bootstrap_worker(
+    settings: Settings,
+    job: PlayJob,
+    *,
+    title: str,
+    artist: str,
+    duration_ms: int | None,
+    isrc: str | None,
+    youtube_video_id_hint: str | None,
+) -> None:
+    """Background YTM lookup — resolve thread waits on video_id_ready."""
+    try:
+        if not (job.title and job.artist):
+            job.title, job.artist = title, artist
+        video_id = _lookup_youtube_video_id(
+            settings,
+            spotify_id=job.spotify_id,
+            title=job.title,
+            artist=job.artist,
+            duration_ms=duration_ms,
+            isrc=isrc,
+            youtube_video_id=youtube_video_id_hint,
+        )
+        if video_id:
+            job.youtube_video_id = video_id
+    except Exception as exc:
+        logger.warning("YTM bootstrap failed job=%s: %s", job.job_id[:8], exc)
+        job.error = str(exc)[:500]
+        job.status = "failed"
+    finally:
+        job.video_id_ready.set()
+
+
 def _resolve_direct_worker(settings: Settings, job: PlayJob) -> None:
-    url, media_type, _ = _ytdlp_resolve_direct_url(
+    if not job.video_id_ready.wait(timeout=YTM_LOOKUP_TIMEOUT):
+        raise RuntimeError("Timed out waiting for YouTube video id")
+    if job.status == "failed":
+        return
+    if not job.youtube_video_id:
+        raise RuntimeError("No YouTube video id after YTM lookup")
+
+    t0 = time.perf_counter()
+    url, media_type, resolved_id = _ytdlp_resolve_direct_url(
         settings,
         query=f"{job.artist} {job.title}",
         spotify_id=job.spotify_id,
+        youtube_video_id=job.youtube_video_id,
     )
     job.direct_url = url
     job.direct_media_type = media_type
+    if resolved_id:
+        job.youtube_video_id = resolved_id
     job.status = "streaming"
-    logger.info("direct stream ready job=%s media=%s", job.job_id[:8], media_type)
+    logger.info(
+        "play_ready job=%s media=%s video=%s total=%sms",
+        job.job_id[:8],
+        media_type,
+        job.youtube_video_id,
+        round((time.perf_counter() - t0) * 1000),
+    )
+
+
+def _start_play_job(
+    settings: Settings,
+    *,
+    job: PlayJob,
+    prepare_only: bool,
+) -> None:
+    """Background yt-dlp resolve; optional full file download for S3 ingest."""
+    start_resolve_thread(job, resolve_fn=lambda j: _resolve_direct_worker(settings, j))
+    if not prepare_only:
+        start_download_thread(
+            job,
+            download_fn=lambda j: _download_job_file(settings, j),
+            upload_fn=lambda j: _upload_job_file(settings, j),
+        )
 
 
 def _ytdlp_to_file(settings: Settings, *, query: str, out_path: Path) -> None:
@@ -518,30 +650,50 @@ def _ytdlp_to_file(settings: Settings, *, query: str, out_path: Path) -> None:
 
 
 def _ytdlp_target_for_job(settings: Settings, job: PlayJob) -> str:
-    cached = _load_resolve_cache(settings, job.spotify_id)
-    video_id = cached.get("youtube_video_id") if cached else None
+    video_id = job.youtube_video_id
+    if not video_id:
+        cached = _load_resolve_cache(settings, job.spotify_id)
+        video_id = cached.get("youtube_video_id") if cached else None
     if video_id:
         return f"https://www.youtube.com/watch?v={video_id}"
     return f"ytsearch1:{job.artist} {job.title}"
+
+
+def _maybe_mark_buffer_ready(job: PlayJob) -> None:
+    if play_ready(job) and not job.buffer_ready.is_set():
+        job.buffer_ready.set()
+        if job.status == "starting":
+            job.status = "streaming"
+        logger.info(
+            "buffer ready job=%s bytes=%s",
+            job.job_id[:8],
+            buffer_bytes(job),
+        )
 
 
 def _feed_broadcast_from_file(job: PlayJob, stem: Path, proc: subprocess.Popen) -> None:
     """Mirror growing file bytes into broadcast buffer while yt-dlp downloads."""
     offset = 0
     try:
-        while proc.poll() is None:
+        while True:
             audio = find_growing_audio(stem)
             if audio is not None:
                 size = audio.stat().st_size
                 if size > offset:
                     with audio.open("rb") as fh:
                         fh.seek(offset)
-                        chunk = fh.read(16384)
+                        chunk = fh.read(65536)
                         if chunk:
                             job.broadcast.feed(chunk)
                             offset += len(chunk)
-            time.sleep(0.05)
+                            _maybe_mark_buffer_ready(job)
+                            continue
+            if proc.poll() is not None:
+                if audio is None or offset >= audio.stat().st_size:
+                    break
+            time.sleep(0.03)
     finally:
+        _maybe_mark_buffer_ready(job)
         job.broadcast.close()
 
 
@@ -629,6 +781,8 @@ def _job_to_status(job: PlayJob) -> JobStatusResponse:
         s3_key=job.s3_key,
         size_bytes=job.size_bytes,
         buffer_bytes=buffer_bytes(job),
+        play_ready=play_ready(job),
+        youtube_video_id=job.youtube_video_id,
         direct_ready=bool(job.direct_url),
         direct_stream_url=job.direct_url,
         direct_media_type=job.direct_media_type if job.direct_url else None,
@@ -718,9 +872,29 @@ async def health() -> HealthResponse:
     )
 
 
-@app.post("/v1/play", response_model=PlayResponse, dependencies=[Depends(_verify_secret)])
-async def play(body: PlayRequest, request: Request) -> PlayResponse:
-    """Start download in background; return stream URL immediately (~1s)."""
+def _metadata_bootstrap_worker(
+    settings: Settings,
+    job: PlayJob,
+    *,
+    url: str,
+    title_hint: str | None,
+    artist_hint: str | None,
+) -> None:
+    try:
+        title, artist = _resolve_metadata(
+            settings,
+            url=url,
+            track_id=job.spotify_id,
+            title_hint=title_hint,
+            artist_hint=artist_hint,
+        )
+        job.title, job.artist = title, artist
+    except Exception as exc:
+        logger.debug("metadata bootstrap skipped job=%s: %s", job.job_id[:8], exc)
+
+
+async def _create_play_job(body: PlayRequest, request: Request) -> PlayResponse:
+    """Return immediately; YTM + yt-dlp resolve run in background threads."""
     settings = get_settings()
     url = str(body.url).split("?", 1)[0]
     spotify_id = _spotify_track_id(url)
@@ -730,23 +904,16 @@ async def play(body: PlayRequest, request: Request) -> PlayResponse:
             detail="Only Spotify track URLs are supported",
         )
 
-    try:
-        title, artist = await asyncio.to_thread(
-            _resolve_metadata,
-            settings,
-            url=url,
-            track_id=spotify_id,
-            title_hint=body.title,
-            artist_hint=body.artist,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)[:500]) from exc
+    title = (body.title or "").strip() or f"Track {spotify_id[:8]}"
+    artist = (body.artist or "").strip() or "Unknown Artist"
 
     filename = _safe_key(body.key, spotify_id=spotify_id, title=title, artist=artist)
     s3_key = f"music/{filename}"
     jobs_dir = settings.moz_download_dir / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
     temp_path = jobs_dir / f"{uuid.uuid4().hex}.mp3"
+
+    cached_video_id = body.youtube_video_id or _peek_video_id_cache(settings, spotify_id)
 
     job = job_store.create(
         spotify_url=url,
@@ -756,12 +923,53 @@ async def play(body: PlayRequest, request: Request) -> PlayResponse:
         s3_key=s3_key,
         temp_path=temp_path,
     )
-    start_resolve_thread(job, resolve_fn=lambda j: _resolve_direct_worker(settings, j))
-    start_download_thread(
-        job,
-        download_fn=lambda j: _download_job_file(settings, j),
-        upload_fn=lambda j: _upload_job_file(settings, j),
-    )
+    job.youtube_video_id = cached_video_id
+    if cached_video_id:
+        job.video_id_ready.set()
+    else:
+        threading.Thread(
+            target=_ytm_bootstrap_worker,
+            args=(settings, job),
+            kwargs={
+                "title": title,
+                "artist": artist,
+                "duration_ms": body.duration_ms,
+                "isrc": body.isrc,
+                "youtube_video_id_hint": body.youtube_video_id,
+            },
+            name=f"moz-ytm-{job.job_id[:8]}",
+            daemon=True,
+        ).start()
+
+    if body.prepare_only and not (body.title and body.artist):
+        threading.Thread(
+            target=_metadata_bootstrap_worker,
+            args=(settings, job),
+            kwargs={
+                "url": url,
+                "title_hint": body.title,
+                "artist_hint": body.artist,
+            },
+            name=f"moz-meta-{job.job_id[:8]}",
+            daemon=True,
+        ).start()
+    elif not (body.title and body.artist):
+        try:
+            title, artist = await asyncio.to_thread(
+                _resolve_metadata,
+                settings,
+                url=url,
+                track_id=spotify_id,
+                title_hint=body.title,
+                artist_hint=body.artist,
+            )
+            job.title, job.artist = title, artist
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)[:500]
+            ) from exc
+
+    _start_play_job(settings, job=job, prepare_only=body.prepare_only)
 
     base = str(request.base_url).rstrip("/")
     stream_url = f"{base}/v1/stream/{job.job_id}?token={job.stream_token}"
@@ -776,6 +984,18 @@ async def play(body: PlayRequest, request: Request) -> PlayResponse:
         spotify_track_id=spotify_id,
         s3_key=s3_key,
     )
+
+
+@app.post("/v1/play", response_model=PlayResponse, dependencies=[Depends(_verify_secret)])
+async def play(body: PlayRequest, request: Request) -> PlayResponse:
+    """Start resolve (+ optional download); return proxy stream URL immediately."""
+    return await _create_play_job(body, request)
+
+
+@app.post("/v1/prepare", response_model=PlayResponse, dependencies=[Depends(_verify_secret)])
+async def prepare(body: PlayRequest, request: Request) -> PlayResponse:
+    """Search warm-up: YTM videoId + background yt-dlp resolve only (no file download)."""
+    return await _create_play_job(body.model_copy(update={"prepare_only": True}), request)
 
 
 @app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse, dependencies=[Depends(_verify_secret)])
@@ -812,7 +1032,24 @@ async def stream_job(
         "Content-Disposition": f'inline; filename="{filename}"',
     }
 
-    direct_url = await asyncio.to_thread(lambda: _wait_for_direct(job, timeout=0.8))
+    direct_url = job.direct_url
+    if not direct_url:
+        direct_url = await asyncio.to_thread(
+            _wait_for_direct, job, timeout=STREAM_DIRECT_WAIT
+        )
+
+    if (
+        not direct_url
+        and job._thread is None
+        and job.status not in ("failed",)
+    ):
+        settings = get_settings()
+        start_download_thread(
+            job,
+            download_fn=lambda j: _download_job_file(settings, j),
+            upload_fn=lambda j: _upload_job_file(settings, j),
+        )
+
     if direct_url:
         upstream_headers = {"User-Agent": "Mozilla/5.0 (compatible; MoziketoDownloader/0.5)"}
         if range_header:
